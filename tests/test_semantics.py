@@ -89,7 +89,34 @@ class TestReferenceEquivalence(unittest.TestCase):
         self.assertEqual(out[1, 0], 4)
 
 
+def _decode_row_bounds(seq_lens, next_n):
+    """Mirror of the window expansion done by ``top_k_per_row_decode``.
+
+    ``seq_lens`` holds one length per *request* (shape ``(B,)`` or ``(B, 1)``),
+    matching upstream ``IndexerTopK._row_ends()``. Each request expands into
+    ``next_n`` speculative rows whose windows end at ``seq_len - next_n + 1 ...
+    seq_len`` and all start at column 0, so the batch is *not* divided by
+    ``next_n`` -- the element count and the row count differ by that factor.
+    """
+    seq_lens = np.asarray(seq_lens, dtype=np.int64).reshape(-1)
+    batch = seq_lens.size
+    offsets = np.arange(next_n, dtype=np.int64)
+    ends = seq_lens.reshape(batch, 1) - next_n + 1 + offsets.reshape(1, next_n)
+    starts = np.zeros(batch * next_n, dtype=np.int32)
+    return starts, ends.clip(min=0).reshape(-1).astype(np.int32)
+
+
 class TestContract(unittest.TestCase):
+    def test_decode_row_ends_expand_per_request(self):
+        """One length per request, ``next_n`` rows per request (not ``numel()/next_n``)."""
+        s, e = _decode_row_bounds([10, 11], 3)
+        np.testing.assert_array_equal(s, np.zeros(6, dtype=np.int32))
+        np.testing.assert_array_equal(e, [8, 9, 10, 9, 10, 11])
+
+        # Requests shorter than the speculative window clamp at 0, never negative.
+        _, short_ends = _decode_row_bounds([2], 4)
+        np.testing.assert_array_equal(short_ends, [0, 0, 1, 2])
+
     def test_short_window_pads_minus_one(self):
         logits = np.arange(24, dtype=np.float32).reshape(3, 8)
         s = np.array([0, 2, 5], dtype=np.int32)

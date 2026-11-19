@@ -96,20 +96,34 @@ private:
     }
 
     // ---------------------------------------------------------------- loads
+    // The chunk tail is initialised explicitly instead of through the copy's padding
+    // count: DataCopyPadExtParams carries `paddingCount` in a uint8_t, so a tail
+    // longer than 255 elements is truncated (e.g. chunk_=32768, validLen=256 keeps
+    // 0 of the 32512 pads and the stale UB contents reach TopK). Pre-filling the
+    // whole chunk with the same sentinel makes the initialisation independent of
+    // the tail length; the copy below only overwrites the valid prefix.
     __aicore__ inline void LoadChunkToFp32(uint64_t rowBase, int32_t colStart, uint32_t validLen)
     {
         LocalTensor<float> src = srcBuf_.Get<float>();
         const T padValue = static_cast<T>(NEG_BIG);
         DataCopyExtParams copyParams{1, static_cast<uint32_t>(validLen * sizeof(T)), 0, 0, 0};
-        DataCopyPadExtParams<T> padParams{true, 0, static_cast<uint8_t>(chunk_ - validLen), padValue};
+        DataCopyPadExtParams<T> padParams{false, 0, 0, padValue};
+        const int32_t chunkLen = static_cast<int32_t>(chunk_);
 
         event_t ready = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+        event_t written = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE2));
         if constexpr (sizeof(T) == sizeof(float)) {
+            Duplicate(src, static_cast<float>(padValue), chunkLen);
+            SetFlag<HardEvent::V_MTE2>(written);
+            WaitFlag<HardEvent::V_MTE2>(written);
             DataCopyPad(src, logitsGm_[rowBase + static_cast<uint64_t>(colStart)], copyParams, padParams);
             SetFlag<HardEvent::MTE2_V>(ready);
             WaitFlag<HardEvent::MTE2_V>(ready);
         } else {
             LocalTensor<T> raw = rawBuf_.Get<T>();
+            Duplicate(raw, padValue, chunkLen);
+            SetFlag<HardEvent::V_MTE2>(written);
+            WaitFlag<HardEvent::V_MTE2>(written);
             DataCopyPad(raw, logitsGm_[rowBase + static_cast<uint64_t>(colStart)], copyParams, padParams);
             SetFlag<HardEvent::MTE2_V>(ready);
             WaitFlag<HardEvent::MTE2_V>(ready);
@@ -172,7 +186,9 @@ private:
         LocalTensor<int32_t> mergeIdx = mergeIdxBuf_.Get<int32_t>();
 
         if (len == 0U) {
-            WriteOut(row, curIdx, 0U);
+            Duplicate(curIdx, static_cast<int32_t>(-1), topkPad_);
+            PipeBarrier<PIPE_V>();
+            WriteOut(row, curIdx);
             return;
         }
 
@@ -213,18 +229,17 @@ private:
             Duplicate(curIdx[validOut], static_cast<int32_t>(-1), topkPad_ - validOut);
             PipeBarrier<PIPE_V>();
         }
-        WriteOut(row, curIdx, validOut);
+        WriteOut(row, curIdx);
     }
 
-    __aicore__ inline void WriteOut(uint32_t row, LocalTensor<int32_t> idx, uint32_t validOut)
+    // The output row is exactly `topk_` entries wide, and every entry is
+    // initialized before this call: the selection itself, then the -1 padding
+    // up to topk_pad (>= topk). Rows shorter than topk must therefore write the
+    // full padded row -- writing only `validOut` entries would leave the tail of
+    // `indices` holding whatever the caller's buffer already contained.
+    __aicore__ inline void WriteOut(uint32_t row, LocalTensor<int32_t> idx)
     {
-        if (validOut == 0U) {
-            Duplicate(idx, static_cast<int32_t>(-1), topkPad_);
-            PipeBarrier<PIPE_V>();
-            validOut = topkPad_;  // write the whole padded row of -1
-        }
-        // clamp: never write more than the requested topk entries
-        const uint32_t count = (validOut > topk_) ? topk_ : validOut;
+        const uint32_t count = topk_;
         event_t syncV = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::V_MTE3));
         SetFlag<HardEvent::V_MTE3>(syncV);
         WaitFlag<HardEvent::V_MTE3>(syncV);

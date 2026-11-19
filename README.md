@@ -81,8 +81,11 @@ csrc/top_k_per_row/
 Per-core work is row-parallel (`rows_per_core = ceil(num_rows / num_aiv_cores)`).
 Inside a row:
 
-1. the window `[s, e)` is streamed in `chunk_size` blocks, each padded with
-   `-FLT_MAX` up to a 32-aligned chunk (`DataCopyPad` + `DataCopyPadExtParams`);
+1. the window `[s, e)` is streamed in `chunk_size` blocks; the whole chunk is
+   pre-filled with the `-FLT_MAX` sentinel by `Duplicate` and only the valid
+   prefix is copied on top. The copy's `paddingCount` is a `uint8_t`, so it
+   silently drops a tail longer than 255 elements (`chunk=32768, L=256` keeps 0
+   of 32512 pads) — pre-filling makes the tail independent of its length;
 2. each chunk is reduced to its own top-k with `AscendC::TopK`
    (`TopKMode::TOPK_NORMAL`), then one `Adds` turns block-local positions into
    absolute column indices;
@@ -97,11 +100,14 @@ Inside a row:
 Tiling never looks at tensor *values*, only shapes/attrs, so the op is safe for
 graph capture (ACLGraph). `chunk_size`, `max_chunks` and the TopK tmp size are
 chosen on the host by probing `AscendC::TopKTilingFunc` and
-`AscendC::GetTopKMaxMinTmpSize` against the UB budget.
+`AscendC::GetTopKMaxMinTmpSize` against the UB budget. The physical chunk is
+`CeilAlign(min(width, 32768), 32)` with a floor of `max(32, topk_pad)`, so rows
+narrower than 256 columns — down to a single column — are legal input rather
+than rejected; the loader pads them up.
 
 ## Integrating into vllm-ascend
 
-1. copy `csrc/top_k_per_row/` to `vllm-ascend/csrc/moe/top_k_per_row/`;
+1. copy `csrc/top_k_per_row/` to `vllm-ascend/csrc/attention/top_k_per_row/`;
 2. add `top_k_per_row` to `CUSTOM_OPS` in `csrc/build_aclnn.sh`;
 3. include `top_k_per_row_torch_adpt.h` from `csrc/torch_binding.cpp` and bind:
 
@@ -126,7 +132,7 @@ called straight from aclnn or from a TileLang/Triton reference harness.
 
 | Layer | Status |
 |---|---|
-| CPU contract tests (`tests/test_semantics.py`) | **passing** — 8 tests, 50 random ragged shapes + ties + NaN/±inf + clamping |
+| CPU contract tests (`tests/test_semantics.py`) | **passing** — 9 tests, 50 random ragged shapes + ties + NaN/±inf + clamping + decode row expansion |
 | Host tiling logic | reviewed, not executed (needs `PlatformAscendC`) |
 | Ascend C kernel | **not compiled yet** — needs CANN 8.3+ on A2/A3 |
 | End-to-end vs `torch.topk` | `tests/test_npu.py`, run on device |
