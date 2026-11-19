@@ -107,6 +107,38 @@ def test_decode_entry_point():
     np.testing.assert_array_equal(got, want)
 
 
+def test_decode_entry_point_next_n():
+    """``seq_lens`` is one length per *request*; ``next_n`` rows expand from each.
+
+    Two requests x next_n=3 gives 6 rows, so ``numel()`` (2) deliberately differs
+    from the row count (6): the shape a ``numel() / next_n`` batch computation
+    would get backwards.
+    """
+    width = 512
+    next_n = 3
+    topk = 64
+    rng = np.random.default_rng(13)
+    seq_lens_host = np.array([64, width], dtype=np.int32)  # 2 requests -> 6 rows
+    num_rows = seq_lens_host.size * next_n
+    base = rng.normal(size=(num_rows, width)).astype(np.float32)
+
+    offsets = np.arange(next_n, dtype=np.int32)
+    ends = seq_lens_host.reshape(-1, 1) - next_n + 1 + offsets.reshape(1, next_n)
+    ends = np.clip(ends, 0, width).reshape(-1).astype(np.int32)
+    starts = np.zeros(num_rows, dtype=np.int32)
+
+    logits = torch.from_numpy(base).to("npu:0")
+    seq_lens = torch.from_numpy(seq_lens_host).to("npu:0")
+    out = torch.empty((num_rows, topk), dtype=torch.int32, device="npu:0")
+    fn = getattr(torch.ops, "_C_ascend").top_k_per_row_decode
+    fn(logits, next_n, seq_lens, out, num_rows,
+       logits.stride(0), logits.stride(1), topk)
+    got = out.cpu().numpy()
+
+    want = top_k_per_row_numpy(base, starts, ends, topk)
+    np.testing.assert_array_equal(got, want)
+
+
 def test_topk_upper_bound_guard():
     logits = torch.zeros((2, 64), dtype=torch.float32, device="npu:0")
     with pytest.raises(RuntimeError):
